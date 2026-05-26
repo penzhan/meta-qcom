@@ -1,4 +1,4 @@
-From 4418bb76c47e8aa1adffb15ad14537a6caff4191 Mon Sep 17 00:00:00 2001
+From 033dbe4238b09990bdc30c1c93b234dcb1e90019 Mon Sep 17 00:00:00 2001
 From: Pengfei Zhang <penzhan@qualcomm.com>
 Date: Mon, 25 May 2026 22:00:00 +0800
 Subject: [PATCH] ath12k: add CFR support
@@ -10,6 +10,26 @@ commands, and DMA ring handling.
 Upstream-Status: Pending
 Signed-off-by: Penzhan <penzhan@qualcomm.com>
 ---
+ drivers/net/wireless/ath/ath12k/Kconfig       |  11 +
+ drivers/net/wireless/ath/ath12k/Makefile      |   1 +
+ drivers/net/wireless/ath/ath12k/cfr.c         | 990 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/cfr.h         | 297 ++++++
+ drivers/net/wireless/ath/ath12k/core.c        |  12 +
+ drivers/net/wireless/ath/ath12k/core.h        |  17 +
+ drivers/net/wireless/ath/ath12k/dbring.c      |  18 +-
+ drivers/net/wireless/ath/ath12k/dbring.h      |   6 +
+ drivers/net/wireless/ath/ath12k/debug.h       |   2 +
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c | 167 +++
+ drivers/net/wireless/ath/ath12k/hw.h          |   3 +
+ drivers/net/wireless/ath/ath12k/mac.c         |  15 +-
+ .../wireless/ath/ath12k/wifi7/hal_wcn7850.c   |   2 +-
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |   4 +
+ drivers/net/wireless/ath/ath12k/wmi.c         | 151 ++-
+ drivers/net/wireless/ath/ath12k/wmi.h         |  87 +-
+ 16 files changed, 1768 insertions(+), 15 deletions(-)
+ create mode 100644 drivers/net/wireless/ath/ath12k/cfr.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/cfr.h
+
 diff --git a/drivers/net/wireless/ath/ath12k/Kconfig b/drivers/net/wireless/ath/ath12k/Kconfig
 index 1ea1af1b8f6c..04692b644fe7 100644
 --- a/drivers/net/wireless/ath/ath12k/Kconfig

@@ -1,4 +1,4 @@
-From bc90abd7f8c5691e80ba9981d2253ca5d53086d1 Mon Sep 17 00:00:00 2001
+From 4a36bdd369d2e2425f6c0914f22441e600653d5f Mon Sep 17 00:00:00 2001
 From: Bruce Ashfield <bruce.ashfield@gmail.com>
 Date: Wed, 13 Jul 2022 12:18:15 -0400
 Subject: [PATCH] tools: use basename to identify file in gen-mach-types
@@ -15,7 +15,6 @@ Signed-off-by: Bruce Ashfield <bruce.ashfield@gmail.com>
 Signed-off-by: Viswanath Kraleti <viswanath.kraleti@oss.qualcomm.com>
 
 Upstream-Status: Inappropriate [Yocto specific]
-
 ---
  arch/arm/tools/gen-mach-types | 6 +++++-
  1 file changed, 5 insertions(+), 1 deletion(-)
