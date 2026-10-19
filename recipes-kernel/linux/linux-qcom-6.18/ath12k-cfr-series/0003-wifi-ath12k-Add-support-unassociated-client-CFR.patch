@@ -1,0 +1,479 @@
+From b870550f1d4d907c9384cb651e25990abc89031a Mon Sep 17 00:00:00 2001
+From: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+Date: Tue, 22 Sep 2026 03:28:09 -0700
+Subject: [PATCH ath-next v1 3/6] wifi: ath12k: Add support unassociated client
+ CFR
+
+Provide debugfs interfaces support to config unassociated client CFR
+from the user space.
+
+To enable CFR capture for unassociated clients,
+
+echo "<mac address> <val> <periodicity>"
+ > /sys/kernel/debug/ieee80211/phyX/ath12k/cfr_unassoc
+
+Mac address: mac address of the client.
+Val: 0 - start CFR capture
+     1 - stop CFR capture
+Periodicity: Periodicity at which hardware is expected to collect CFR
+dump.
+     0 - single shot capture.
+     non zero - for Periodic captures (value must be multiple of 10 ms)
+
+Change-Id: I4c9bfc84f994a58146850098976c51a8d28069cb
+Signed-off-by: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/cfr.c | 229 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/cfr.h |  33 ++++
+ drivers/net/wireless/ath/ath12k/mac.c |  13 +-
+ drivers/net/wireless/ath/ath12k/wmi.c |  28 +++-
+ drivers/net/wireless/ath/ath12k/wmi.h |   2 +-
+ 5 files changed, 295 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.c b/drivers/net/wireless/ath/ath12k/cfr.c
+index 5807ec362767..6d3eed938986 100644
+--- a/drivers/net/wireless/ath/ath12k/cfr.c
++++ b/drivers/net/wireless/ath/ath12k/cfr.c
+@@ -15,6 +15,60 @@ static int ath12k_cfr_process_data(struct ath12k *ar,
+ 	return 0;
+ }
+ 
++/* Helper function to check whether the given peer mac address
++ * is in unassociated peer pool or not.
++ */
++bool ath12k_cfr_peer_is_in_cfr_unassoc_pool(struct ath12k *ar, const u8 *peer_mac)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct cfr_unassoc_pool_entry *entry;
++	int i;
++
++	if (!ar->cfr_enabled)
++		return false;
++
++	spin_lock_bh(&cfr->lock);
++	for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++		entry = &cfr->unassoc_pool[i];
++		if (!entry->is_valid)
++			continue;
++
++		if (ether_addr_equal(peer_mac, entry->peer_mac)) {
++			spin_unlock_bh(&cfr->lock);
++			return true;
++		}
++	}
++
++	spin_unlock_bh(&cfr->lock);
++
++	return false;
++}
++
++void ath12k_cfr_update_unassoc_pool_entry(struct ath12k *ar,
++					  const u8 *peer_mac)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct cfr_unassoc_pool_entry *entry;
++	int i;
++
++	spin_lock_bh(&cfr->lock);
++	for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++		entry = &cfr->unassoc_pool[i];
++		if (!entry->is_valid)
++			continue;
++
++		if (ether_addr_equal(peer_mac, entry->peer_mac) &&
++		    entry->period == 0) {
++			memset(entry->peer_mac, 0, ETH_ALEN);
++			entry->is_valid = false;
++			cfr->cfr_enabled_peer_cnt--;
++			break;
++		}
++	}
++
++	spin_unlock_bh(&cfr->lock);
++}
++
+ void ath12k_cfr_decrement_peer_count(struct ath12k *ar,
+ 				     struct ath12k_link_sta *arsta)
+ {
+@@ -130,6 +184,59 @@ int ath12k_cfr_send_peer_cfr_capture_cmd(struct ath12k *ar,
+ 	return ret;
+ }
+ 
++void ath12k_cfr_update_unassoc_pool(struct ath12k *ar,
++				    struct ath12k_per_peer_cfr_capture *params,
++				    u8 *peer_mac)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct cfr_unassoc_pool_entry *entry;
++	int available_idx = -1;
++	int i;
++
++	guard(spinlock_bh)(&cfr->lock);
++
++	if (!params->cfr_enable) {
++		for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++			entry = &cfr->unassoc_pool[i];
++			if (ether_addr_equal(peer_mac, entry->peer_mac)) {
++				memset(entry->peer_mac, 0, ETH_ALEN);
++				entry->is_valid = false;
++				cfr->cfr_enabled_peer_cnt--;
++				break;
++			}
++		}
++		return;
++	}
++
++	if (cfr->cfr_enabled_peer_cnt >= ATH12K_MAX_CFR_ENABLED_CLIENTS) {
++		ath12k_info(ar->ab, "Max cfr peer threshold reached\n");
++		return;
++	}
++
++	for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++		entry = &cfr->unassoc_pool[i];
++
++		if (ether_addr_equal(peer_mac, entry->peer_mac)) {
++			ath12k_info(ar->ab,
++				    "peer entry already present updating params\n");
++			entry->period = params->cfr_period;
++			available_idx = -1;
++			break;
++		}
++
++		if (available_idx < 0 && !entry->is_valid)
++			available_idx = i;
++	}
++
++	if (available_idx >= 0) {
++		entry = &cfr->unassoc_pool[available_idx];
++		ether_addr_copy(entry->peer_mac, peer_mac);
++		entry->period = params->cfr_period;
++		entry->is_valid = true;
++		cfr->cfr_enabled_peer_cnt++;
++	}
++}
++
+ static ssize_t ath12k_read_file_enable_cfr(struct file *file,
+ 					   char __user *user_buf,
+ 					   size_t count, loff_t *ppos)
+@@ -188,10 +295,128 @@ static const struct file_operations fops_enable_cfr = {
+ 	.llseek = default_llseek,
+ }
+ 
++static ssize_t ath12k_write_file_cfr_unassoc(struct file *file,
++					     const char __user *ubuf,
++					     size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct cfr_unassoc_pool_entry *entry;
++	u8 peer_mac[6];
++	char buf[64] = {};
++	u32 cfr_capture_enable;
++	u32 cfr_capture_period;
++	int available_idx = -1;
++	int ret, i;
++
++	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, ubuf, count);
++
++	guard(wiphy)(ath12k_ar_to_hw(ar)->wiphy);
++	guard(spinlock_bh)(&cfr->lock);
++
++	if (ah->state != ATH12K_HW_STATE_ON)
++		return -ENETDOWN;
++
++	if (!ar->cfr_enabled) {
++		ath12k_err(ar->ab, "CFR is not enabled on this pdev %d\n",
++			   ar->pdev_idx);
++		return -EINVAL;
++	}
++
++	ret = sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx %u %u",
++		     &peer_mac[0], &peer_mac[1], &peer_mac[2], &peer_mac[3],
++		     &peer_mac[4], &peer_mac[5], &cfr_capture_enable,
++		     &cfr_capture_period);
++
++	if (ret < 1)
++		return -EINVAL;
++
++	if (cfr_capture_enable && ret != 8)
++		return -EINVAL;
++
++	if (!cfr_capture_enable) {
++		for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++			entry = &cfr->unassoc_pool[i];
++			if (ether_addr_equal(peer_mac, entry->peer_mac)) {
++				memset(entry->peer_mac, 0, ETH_ALEN);
++				entry->is_valid = false;
++				cfr->cfr_enabled_peer_cnt--;
++			}
++		}
++
++		return count;
++	}
++
++	if (cfr->cfr_enabled_peer_cnt >= ATH12K_MAX_CFR_ENABLED_CLIENTS) {
++		ath12k_info(ar->ab, "Max cfr peer threshold reached\n");
++		return count;
++	}
++
++	for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++		entry = &cfr->unassoc_pool[i];
++
++		if (available_idx < 0 && !entry->is_valid)
++			available_idx = i;
++
++		if (ether_addr_equal(peer_mac, entry->peer_mac)) {
++			ath12k_info(ar->ab,
++				    "peer entry already present updating params\n");
++			entry->period = cfr_capture_period;
++			return count;
++		}
++	}
++
++	if (available_idx >= 0) {
++		entry = &cfr->unassoc_pool[available_idx];
++		ether_addr_copy(entry->peer_mac, peer_mac);
++		entry->period = cfr_capture_period;
++		entry->is_valid = true;
++		cfr->cfr_enabled_peer_cnt++;
++	}
++
++	return count;
++}
++
++static ssize_t ath12k_read_file_cfr_unassoc(struct file *file,
++					    char __user *ubuf,
++					    size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct cfr_unassoc_pool_entry *entry;
++	char buf[512] = {};
++	int len = 0, i;
++
++	spin_lock_bh(&cfr->lock);
++
++	for (i = 0; i < ATH12K_MAX_CFR_ENABLED_CLIENTS; i++) {
++		entry = &cfr->unassoc_pool[i];
++		if (entry->is_valid)
++			len += scnprintf(buf + len, sizeof(buf) - len,
++					 "peer: %pM period: %u\n",
++					 entry->peer_mac, entry->period);
++	};
++
++	spin_unlock_bh(&cfr->lock);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_configure_cfr_unassoc = {
++	.write = ath12k_write_file_cfr_unassoc,
++	.read = ath12k_read_file_cfr_unassoc,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++}
++
+ static void ath12k_cfr_debug_unregister(struct ath12k *ar)
+ {
+ 	debugfs_remove(ar->cfr.enable_cfr);
+ 	ar->cfr.enable_cfr = NULL;
++	debugfs_remove(ar->cfr.cfr_unassoc);
++	ar->cfr.cfr_unassoc = NULL;
+ }
+ 
+ static void ath12k_cfr_debug_register(struct ath12k *ar)
+@@ -199,6 +424,10 @@ static void ath12k_cfr_debug_register(struct ath12k *ar)
+ 	ar->cfr.enable_cfr = debugfs_create_file("enable_cfr", 0600,
+ 						 ar->debug.debugfs_pdev, ar,
+ 						 &fops_enable_cfr);
++
++	ar->cfr.cfr_unassoc = debugfs_create_file("cfr_unassoc", 0600,
++						  ar->debug.debugfs_pdev, ar,
++						  &fops_configure_cfr_unassoc);
+ }
+ 
+ void ath12k_cfr_lut_update_paddr(struct ath12k *ar, dma_addr_t paddr,
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.h b/drivers/net/wireless/ath/ath12k/cfr.h
+index ccd8e0ef5556..a011d82067ee 100644
+--- a/drivers/net/wireless/ath/ath12k/cfr.h
++++ b/drivers/net/wireless/ath/ath12k/cfr.h
+@@ -46,6 +46,12 @@ struct ath12k_look_up_table {
+ 	struct ath12k_dbring_element *buff;
+ };
+ 
++struct cfr_unassoc_pool_entry {
++	u8 peer_mac[ETH_ALEN];
++	u32 period;
++	bool is_valid;
++};
++
+ struct ath12k_cfr {
+ 	struct ath12k_dbring rx_ring;
+ 	/* Protect cfr data */
+@@ -54,6 +60,7 @@ struct ath12k_cfr {
+ 	spinlock_t lut_lock;
+ 	struct ath12k_look_up_table *lut;
+ 	struct dentry *enable_cfr;
++	struct dentry *cfr_unassoc;
+ 	u8 cfr_enabled_peer_cnt;
+ 	u32 lut_num;
+ 	u64 tx_evt_cnt;
+@@ -67,6 +74,7 @@ struct ath12k_cfr {
+ 	u64 clear_txrx_event;
+ 	u64 cfr_dma_aborts;
+ 	bool enabled;
++	struct cfr_unassoc_pool_entry unassoc_pool[ATH12K_MAX_CFR_ENABLED_CLIENTS];
+ };
+ 
+ enum ath12k_cfr_capture_method {
+@@ -90,6 +98,13 @@ void ath12k_cfr_lut_update_paddr(struct ath12k *ar, dma_addr_t paddr,
+ 				 u32 buf_id);
+ void ath12k_cfr_decrement_peer_count(struct ath12k *ar,
+ 				     struct ath12k_link_sta *arsta);
++void ath12k_cfr_update_unassoc_pool_entry(struct ath12k *ar,
++					  const u8 *peer_mac);
++bool ath12k_cfr_peer_is_in_cfr_unassoc_pool(struct ath12k *ar,
++					    const u8 *peer_mac);
++void ath12k_cfr_update_unassoc_pool(struct ath12k *ar,
++				    struct ath12k_per_peer_cfr_capture *params,
++				    u8 *peer_mac);
+ int ath12k_cfr_send_peer_cfr_capture_cmd(struct ath12k *ar,
+ 					 struct ath12k_link_sta *arsta,
+ 					 struct ath12k_per_peer_cfr_capture *params,
+@@ -114,6 +129,24 @@ static inline void ath12k_cfr_decrement_peer_count(struct ath12k *ar,
+ {
+ }
+ 
++static inline void ath12k_cfr_update_unassoc_pool_entry(struct ath12k *ar,
++							const u8 *peer_mac)
++{
++}
++
++static inline bool
++ath12k_cfr_peer_is_in_cfr_unassoc_pool(struct ath12k *ar, const u8 *peer_mac)
++{
++	return false;
++}
++
++static inline void
++ath12k_cfr_update_unassoc_pool(struct ath12k *ar,
++			       struct ath12k_per_peer_cfr_capture *params,
++			       u8 *peer_mac)
++{
++}
++
+ static inline int
+ ath12k_cfr_send_peer_cfr_capture_cmd(struct ath12k *ar,
+ 				     struct ath12k_link_sta *arsta,
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 6a3a9be2e660..0c18dd26fdaa 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -9042,6 +9042,8 @@ static int ath12k_mac_mgmt_tx_wmi(struct ath12k *ar, struct ath12k_link_vif *arv
+ 	dma_addr_t paddr;
+ 	int buf_id;
+ 	int ret;
++	bool tx_params_valid = false;
++	bool peer_in_unassoc_pool;
+ 
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+@@ -9075,7 +9077,16 @@ static int ath12k_mac_mgmt_tx_wmi(struct ath12k *ar, struct ath12k_link_vif *arv
+ 
+ 	skb_cb->paddr = paddr;
+ 
+-	ret = ath12k_wmi_mgmt_send(arvif, buf_id, skb);
++	peer_in_unassoc_pool = ath12k_cfr_peer_is_in_cfr_unassoc_pool(ar, hdr->addr1);
++	if (peer_in_unassoc_pool)
++		ath12k_cfr_update_unassoc_pool_entry(ar, hdr->addr1);
++
++	if (ar->cfr_enabled &&
++	    ieee80211_is_probe_resp(hdr->frame_control) &&
++	    peer_in_unassoc_pool)
++		tx_params_valid = true;
++
++	ret = ath12k_wmi_mgmt_send(arvif, buf_id, skb, tx_params_valid);
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to send mgmt frame: %d\n", ret);
+ 		goto err_unmap_buf;
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index df61d49e06a4..9ea8d391b822 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -711,7 +711,7 @@ struct sk_buff *ath12k_wmi_alloc_skb(struct ath12k_wmi_base *wmi_ab, u32 len)
+ }
+ 
+ int ath12k_wmi_mgmt_send(struct ath12k_link_vif *arvif, u32 buf_id,
+-			 struct sk_buff *frame)
++			 struct sk_buff *frame, bool tx_params_valid)
+ {
+ 	struct ath12k *ar = arvif->ar;
+ 	struct ath12k_wmi_pdev *wmi = ar->wmi;
+@@ -719,6 +719,7 @@ int ath12k_wmi_mgmt_send(struct ath12k_link_vif *arvif, u32 buf_id,
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(frame);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)frame->data;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
++	struct ath12k_wmi_mgmt_send_tx_params *tx_params;
+ 	int cmd_len = sizeof(struct ath12k_wmi_mgmt_send_tx_params);
+ 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)hdr;
+ 	struct ath12k_wmi_mlo_mgmt_send_params *ml_params;
+@@ -751,6 +752,9 @@ int ath12k_wmi_mgmt_send(struct ath12k_link_vif *arvif, u32 buf_id,
+ 		}
+ 	}
+ 
++	if (!link_agnostic && tx_params_valid)
++		len += cmd_len;
++
+ 	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
+ 	if (!skb)
+ 		return -ENOMEM;
+@@ -772,16 +776,24 @@ int ath12k_wmi_mgmt_send(struct ath12k_link_vif *arvif, u32 buf_id,
+ 
+ 	memcpy(frame_tlv->value, frame->data, buf_len);
+ 
+-	if (!link_agnostic)
+-		goto send;
+-
+ 	ptr = skb->data + sizeof(*cmd) + sizeof(*frame_tlv) + buf_len_aligned;
+ 
+-	tlv = ptr;
++	if (tx_params_valid) {
++		tx_params = (struct ath12k_wmi_mgmt_send_tx_params *)ptr;
++		tx_params->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_TX_SEND_PARAMS, cmd_len);
++		tx_params->tx_param_dword1 = cpu_to_le32(WMI_TX_PARAMS_DWORD1_CFR_CAPTURE);
++		ptr += cmd_len;
++	} else if (!link_agnostic) {
++		goto send;
++	} else {
++		tlv = ptr;
++		/* Tx params not used currently */
++		tlv->header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_TX_SEND_PARAMS, cmd_len);
++		ptr += cmd_len;
++	}
+ 
+-	/* Tx params not used currently */
+-	tlv->header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_TX_SEND_PARAMS, cmd_len);
+-	ptr += cmd_len;
++	if (!link_agnostic)
++		goto send;
+ 
+ 	tlv = ptr;
+ 	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT, sizeof(*ml_params));
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index d93fd41fc353..232d61fbc837 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -6414,7 +6414,7 @@ int ath12k_wmi_cmd_send(struct ath12k_wmi_pdev *wmi, struct sk_buff *skb,
+ 			u32 cmd_id);
+ struct sk_buff *ath12k_wmi_alloc_skb(struct ath12k_wmi_base *wmi_sc, u32 len);
+ int ath12k_wmi_mgmt_send(struct ath12k_link_vif *arvif, u32 buf_id,
+-			 struct sk_buff *frame);
++			 struct sk_buff *frame, bool tx_params_valid);
+ int ath12k_wmi_p2p_go_bcn_ie(struct ath12k *ar, u32 vdev_id,
+ 			     const u8 *p2p_ie);
+ int ath12k_wmi_bcn_tmpl(struct ath12k_link_vif *arvif,
+-- 
+2.34.1
+

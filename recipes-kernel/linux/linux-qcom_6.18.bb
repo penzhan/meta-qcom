@@ -29,7 +29,7 @@ SRCBRANCH:class-devupstream ?= "branch=qcom-6.18.y"
 SRC_URI = " \
     git://github.com/qualcomm-linux/kernel.git;${SRCBRANCH};protocol=https \
     file://0001-tools-use-basename-to-identify-file-in-gen-mach-type.patch \
-    file://0001-ath12k-add-CFR-support.patch \
+    file://0001-wifi-ath12k-Add-initialization-and-deinitialization-linux-6.18.patch \
 "
 
 # Additional kernel configs.

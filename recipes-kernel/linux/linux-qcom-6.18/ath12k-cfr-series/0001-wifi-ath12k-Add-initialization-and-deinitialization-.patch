@@ -1,0 +1,563 @@
+From dcabf3a0209f6e48533a22728d555d48a53304e6 Mon Sep 17 00:00:00 2001
+From: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+Date: Mon, 21 Sep 2026 19:58:57 -0700
+Subject: [PATCH ath-next v1 1/6] wifi: ath12k: Add initialization and
+ deinitialization sequence for CFR module
+
+Channel Frequency Response (CFR) module will be initialized only when
+the following criteria passes:
+ * Enabled CFR support for the hardware through the hardware param
+   'cfr_support'
+ * WMI service enabled for the CFR support
+   'WMI_TLV_SERVICE_CFR_CAPTURE_SUPPORT'
+
+Also, provide a configuration option CONFIG_ATH12K_CFR to enable CFR
+feature support during the compilation time.
+
+CFR module initialization includes Direct Buffer(DB) ring initialization
+where hardware uses the DB ring buffers to copy CFR data to host.
+Number of buffers and buffer size of the ring is based on the DB ring
+capabilities advertised by the firmware through WMI service ready.
+Also ring configurations are sent to firmware through
+ath12k_dbring_wmi_cfg_setup().
+
+Predefine ath12k_cfr_dma_hdr, ath12k_look_up_table, and ath12k_cfr
+structs and fields for subsequent patches.
+
+Change-Id: I533dc3030127466df606a2e3644bc0897b939c3e
+Signed-off-by: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/Kconfig       |  11 ++
+ drivers/net/wireless/ath/ath12k/Makefile      |   1 +
+ drivers/net/wireless/ath/ath12k/cfr.c         | 172 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/cfr.h         |  83 +++++++++
+ drivers/net/wireless/ath/ath12k/core.c        |  21 +++
+ drivers/net/wireless/ath/ath12k/core.h        |   6 +
+ drivers/net/wireless/ath/ath12k/dbring.c      |  13 +-
+ drivers/net/wireless/ath/ath12k/dbring.h      |   5 +
+ drivers/net/wireless/ath/ath12k/hw.h          |   3 +
+ .../wireless/ath/ath12k/wifi7/hal_wcn7850.c   |   2 +-
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |  20 ++
+ 11 files changed, 331 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/net/wireless/ath/ath12k/cfr.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/cfr.h
+
+diff --git a/drivers/net/wireless/ath/ath12k/Kconfig b/drivers/net/wireless/ath/ath12k/Kconfig
+index 1ea1af1b8f6c..04692b644fe7 100644
+--- a/drivers/net/wireless/ath/ath12k/Kconfig
++++ b/drivers/net/wireless/ath/ath12k/Kconfig
+@@ -60,3 +60,14 @@ config ATH12K_COREDUMP
+ 
+ 	  If unsure, say Y to make it easier to debug problems. But if
+ 	  dump collection not required choose N.
++
++config ATH12K_CFR
++	bool "ath12k channel frequency response support"
++	depends on ATH12K_DEBUGFS
++	depends on RELAY
++	help
++	  Enable ath12k channel frequency response dump support.
++	  This option exposes debugfs nodes that will allow the user
++	  to enable, disable, and dump data.
++
++	  Say Y to enable CFR data dump collection via debugfs.
+diff --git a/drivers/net/wireless/ath/ath12k/Makefile b/drivers/net/wireless/ath/ath12k/Makefile
+index 3ba1236956cc..5698e6ad242d 100644
+--- a/drivers/net/wireless/ath/ath12k/Makefile
++++ b/drivers/net/wireless/ath/ath12k/Makefile
+@@ -32,6 +32,7 @@ ath12k-$(CONFIG_ATH12K_TRACING) += trace.o
+ ath12k-$(CONFIG_PM) += wow.o
+ ath12k-$(CONFIG_ATH12K_COREDUMP) += coredump.o
+ ath12k-$(CONFIG_NL80211_TESTMODE) += testmode.o
++ath12k-$(CONFIG_ATH12K_CFR) += cfr.o
+ 
+ # for tracing framework to find trace.h
+ CFLAGS_trace.o := -I$(src)
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.c b/drivers/net/wireless/ath/ath12k/cfr.c
+new file mode 100644
+index 000000000000..a6d1a37583a4
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/cfr.c
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#include <linux/relay.h>
++#include "core.h"
++#include "debug.h"
++#include <linux/bitfield.h>
++
++static int ath12k_cfr_process_data(struct ath12k *ar,
++				   struct ath12k_dbring_data *param)
++{
++	return 0;
++}
++
++void ath12k_cfr_lut_update_paddr(struct ath12k *ar, dma_addr_t paddr,
++				 u32 buf_id)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++
++	if (cfr->lut)
++		cfr->lut[buf_id].dbr_address = paddr;
++}
++
++static void ath12k_cfr_ring_free(struct ath12k *ar)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++
++	ath12k_dbring_buf_cleanup(ar, &cfr->rx_ring);
++	ath12k_dbring_srng_cleanup(ar, &cfr->rx_ring);
++}
++
++static int ath12k_cfr_ring_alloc(struct ath12k *ar,
++				 struct ath12k_dbring_cap *db_cap)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++	int ret;
++
++	ret = ath12k_dbring_srng_setup(ar, &cfr->rx_ring,
++				       ATH12K_CFR_NUM_RING_ENTRIES,
++				       db_cap->min_elem);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to setup db ring: %d\n", ret);
++		return ret;
++	}
++
++	ath12k_dbring_set_cfg(ar, &cfr->rx_ring,
++			      ATH12K_CFR_NUM_RESP_PER_EVENT,
++			      ATH12K_CFR_EVENT_TIMEOUT_MS,
++			      ath12k_cfr_process_data);
++
++	ret = ath12k_dbring_buf_setup(ar, &cfr->rx_ring, db_cap);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to setup db ring buffer: %d\n", ret);
++		goto srng_cleanup;
++	}
++
++	ret = ath12k_dbring_wmi_cfg_setup(ar, &cfr->rx_ring, WMI_DIRECT_BUF_CFR);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to setup db ring cfg: %d\n", ret);
++		goto buffer_cleanup;
++	}
++
++	return 0;
++
++buffer_cleanup:
++	ath12k_dbring_buf_cleanup(ar, &cfr->rx_ring);
++srng_cleanup:
++	ath12k_dbring_srng_cleanup(ar, &cfr->rx_ring);
++	return ret;
++}
++
++void ath12k_cfr_deinit(struct ath12k_base *ab)
++{
++	struct ath12k_cfr *cfr;
++	struct ath12k *ar;
++	int i;
++
++	if (!test_bit(WMI_TLV_SERVICE_CFR_CAPTURE_SUPPORT, ab->wmi_ab.svc_map) ||
++	    !ab->hw_params->cfr_support)
++		return;
++
++	for (i = 0; i <  ab->num_radios; i++) {
++		ar = ab->pdevs[i].ar;
++		cfr = &ar->cfr;
++
++		if (!cfr->enabled)
++			continue;
++
++		ath12k_cfr_ring_free(ar);
++
++		spin_lock_bh(&cfr->lut_lock);
++		kfree(cfr->lut);
++		cfr->lut = NULL;
++		cfr->enabled = false;
++		spin_unlock_bh(&cfr->lut_lock);
++	}
++}
++
++int ath12k_cfr_init(struct ath12k_base *ab)
++{
++	struct ath12k_dbring_cap db_cap;
++	struct ath12k_cfr *cfr;
++	u32 num_lut_entries;
++	struct ath12k *ar;
++	int i, ret;
++
++	if (!test_bit(WMI_TLV_SERVICE_CFR_CAPTURE_SUPPORT, ab->wmi_ab.svc_map) ||
++	    !ab->hw_params->cfr_support)
++		return 0;
++
++	for (i = 0; i < ab->num_radios; i++) {
++		ar = ab->pdevs[i].ar;
++		cfr = &ar->cfr;
++
++		ret = ath12k_dbring_get_cap(ar->ab, ar->pdev_idx,
++					    WMI_DIRECT_BUF_CFR, &db_cap);
++
++		if (ret)
++			continue;
++
++		idr_init(&cfr->rx_ring.bufs_idr);
++		spin_lock_init(&cfr->rx_ring.idr_lock);
++		spin_lock_init(&cfr->lock);
++		spin_lock_init(&cfr->lut_lock);
++
++		num_lut_entries = min_t(u32, CFR_MAX_LUT_ENTRIES, db_cap.min_elem);
++		cfr->lut = kzalloc_objs(*cfr->lut, num_lut_entries, GFP_KERNEL);
++		if (!cfr->lut) {
++			ret = -ENOMEM;
++			goto err;
++		}
++
++		ret = ath12k_cfr_ring_alloc(ar, &db_cap);
++		if (ret) {
++			ath12k_warn(ab, "failed to init cfr ring for pdev %d: %d\n",
++				    i, ret);
++			spin_lock_bh(&cfr->lut_lock);
++			kfree(cfr->lut);
++			cfr->lut = NULL;
++			cfr->enabled = false;
++			spin_unlock_bh(&cfr->lut_lock);
++			goto err;
++		}
++
++		cfr->lut_num = num_lut_entries;
++		cfr->enabled = true;
++
++	}
++
++	return 0;
++
++err:
++	for (i = i - 1; i >= 0; i--) {
++		ar = ab->pdevs[i].ar;
++		cfr = &ar->cfr;
++
++		if (!cfr->enabled)
++			continue;
++
++		ath12k_cfr_ring_free(ar);
++
++		spin_lock_bh(&cfr->lut_lock);
++		kfree(cfr->lut);
++		cfr->lut = NULL;
++		cfr->enabled = false;
++		spin_unlock_bh(&cfr->lut_lock);
++	}
++	return ret;
++}
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.h b/drivers/net/wireless/ath/ath12k/cfr.h
+new file mode 100644
+index 000000000000..04dc80e40887
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/cfr.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef ATH12K_CFR_H
++#define ATH12K_CFR_H
++
++#include "dbring.h"
++#include "wmi.h"
++
++#define ATH12K_CFR_NUM_RESP_PER_EVENT   1
++#define ATH12K_CFR_EVENT_TIMEOUT_MS     1
++#define ATH12K_CFR_NUM_RING_ENTRIES     1
++
++
++struct ath12k_cfr_dma_hdr {
++	u16 info0;
++	u16 info1;
++	u16 sw_peer_id;
++	u16 phy_ppdu_id;
++};
++
++struct ath12k_look_up_table {
++	bool dbr_recv;
++	bool tx_recv;
++	u8 *data;
++	u32 data_len;
++	u16 dbr_ppdu_id;
++	u16 tx_ppdu_id;
++	dma_addr_t dbr_address;
++	struct ath12k_csi_cfr_header header;
++	struct ath12k_cfr_dma_hdr hdr;
++	u64 txrx_tstamp;
++	u64 dbr_tstamp;
++	u32 header_length;
++	u32 payload_length;
++	struct ath12k_dbring_element *buff;
++};
++
++struct ath12k_cfr {
++	struct ath12k_dbring rx_ring;
++	/* Protect cfr data */
++	spinlock_t lock;
++	/* Protect for lut entries */
++	spinlock_t lut_lock;
++	struct ath12k_look_up_table *lut;
++	u32 lut_num;
++	u64 tx_evt_cnt;
++	u64 dbr_evt_cnt;
++	u64 release_cnt;
++	u64 tx_peer_status_cfr_fail;
++	u64 tx_evt_status_cfr_fail;
++	u64 tx_dbr_lookup_fail;
++	u64 last_success_tstamp;
++	u64 flush_dbr_cnt;
++	u64 clear_txrx_event;
++	u64 cfr_dma_aborts;
++	bool enabled;
++};
++
++#ifdef CONFIG_ATH12K_CFR
++int ath12k_cfr_init(struct ath12k_base *ab);
++void ath12k_cfr_deinit(struct ath12k_base *ab);
++void ath12k_cfr_lut_update_paddr(struct ath12k *ar, dma_addr_t paddr,
++				 u32 buf_id);
++#else
++static inline int ath12k_cfr_init(struct ath12k_base *ab)
++{
++	return 0;
++}
++
++static inline void ath12k_cfr_deinit(struct ath12k_base *ab)
++{
++}
++
++static inline void ath12k_cfr_lut_update_paddr(struct ath12k *ar,
++					       dma_addr_t paddr, u32 buf_id)
++{
++}
++#endif /* CONFIG_ATH12K_CFR */
++#endif /* ATH12K_CFR_H */
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 9d6c50a94e64..e22a28131139 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -863,7 +863,17 @@ static int ath12k_core_pdev_create(struct ath12k_base *ab)
+ 		return ret;
+ 	}
+ 
++	ret = ath12k_cfr_init(ab);
++	if (ret) {
++		ath12k_err(ab, "failed to init cfr %d\n", ret);
++		goto err_dp_pdev_free;
++	}
++
+ 	return 0;
++
++err_dp_pdev_free:
++	ath12k_dp_pdev_free(ab);
++	return ret;
+ }
+ 
+ static void ath12k_core_pdev_destroy(struct ath12k_base *ab)
+@@ -1004,6 +1014,16 @@ static void ath12k_core_hw_group_stop(struct ath12k_hw_group *ag)
+ 
+ 	clear_bit(ATH12K_GROUP_FLAG_REGISTERED, &ag->flags);
+ 
++	for (i = ag->num_devices - 1; i >= 0; i--) {
++		ab = ag->ab[i];
++		if (!ab)
++			continue;
++
++		mutex_lock(&ab->core_lock);
++		ath12k_cfr_deinit(ab);
++		mutex_unlock(&ab->core_lock);
++	}
++
+ 	ath12k_mac_unregister(ag);
+ 
+ 	for (i = ag->num_devices - 1; i >= 0; i--) {
+@@ -1361,6 +1381,7 @@ static int ath12k_core_reconfigure_on_crash(struct ath12k_base *ab)
+ 
+ 	mutex_lock(&ab->core_lock);
+ 	ath12k_link_sta_rhash_tbl_destroy(ab);
++	ath12k_cfr_deinit(ab);
+ 	ath12k_dp_pdev_free(ab);
+ 	ath12k_ce_cleanup_pipes(ab);
+ 	ath12k_wmi_detach(ab);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index d15eb7c8a45a..ceaef5469df3 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -36,6 +36,7 @@
+ #include "coredump.h"
+ #include "cmn_defs.h"
+ #include "dp_cmn.h"
++#include "cfr.h"
+ 
+ #define SM(_v, _f) (((_v) << _f##_LSB) & _f##_MASK)
+ 
+@@ -511,6 +512,7 @@ struct ath12k_link_sta {
+ 
+ 	/* peer addr based rhashtable list pointer */
+ 	struct rhash_head rhash_addr;
++
+ };
+ 
+ struct ath12k_sta {
+@@ -757,6 +759,10 @@ struct ath12k {
+ 
+ 	s8 max_allowed_tx_power;
+ 	struct ath12k_pdev_rssi_offsets rssi_info;
++#ifdef CONFIG_ATH12K_CFR
++	struct ath12k_cfr cfr;
++#endif
++	bool cfr_enabled;
+ };
+ 
+ struct ath12k_hw {
+diff --git a/drivers/net/wireless/ath/ath12k/dbring.c b/drivers/net/wireless/ath/ath12k/dbring.c
+index f71ec2a58469..4a9ef50ec9a0 100644
+--- a/drivers/net/wireless/ath/ath12k/dbring.c
++++ b/drivers/net/wireless/ath/ath12k/dbring.c
+@@ -8,10 +8,11 @@
+ #include "debug.h"
+ #include "hal.h"
+ 
+-static int ath12k_dbring_bufs_replenish(struct ath12k *ar,
+-					struct ath12k_dbring *ring,
+-					struct ath12k_dbring_element *buff,
+-					gfp_t gfp)
++int ath12k_dbring_bufs_replenish(struct ath12k *ar,
++				 struct ath12k_dbring *ring,
++				 struct ath12k_dbring_element *buff,
++				 enum wmi_direct_buffer_module id,
++				 gfp_t gfp)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct hal_srng *srng;
+@@ -50,6 +51,9 @@ static int ath12k_dbring_bufs_replenish(struct ath12k *ar,
+ 		goto err_idr_remove;
+ 	}
+ 
++	if (id == WMI_DIRECT_BUF_CFR)
++		ath12k_cfr_lut_update_paddr(ar, paddr, buf_id);
++
+ 	buff->paddr = paddr;
+ 
+ 	cookie = u32_encode_bits(ar->pdev_idx, DP_RXDMA_BUF_COOKIE_PDEV_ID) |
+@@ -142,7 +146,6 @@ int ath12k_dbring_wmi_cfg_setup(struct ath12k *ar,
+ 		ath12k_warn(ar->ab, "failed to setup db ring cfg\n");
+ 		return ret;
+ 	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dbring.h b/drivers/net/wireless/ath/ath12k/dbring.h
+index e1c0eba774ec..7ee8f35848b7 100644
+--- a/drivers/net/wireless/ath/ath12k/dbring.h
++++ b/drivers/net/wireless/ath/ath12k/dbring.h
+@@ -61,6 +61,11 @@ int ath12k_dbring_set_cfg(struct ath12k *ar,
+ 			  u32 event_timeout_ms,
+ 			  int (*handler)(struct ath12k *,
+ 					 struct ath12k_dbring_data *));
++int ath12k_dbring_bufs_replenish(struct ath12k *ar,
++				 struct ath12k_dbring *ring,
++				 struct ath12k_dbring_element *buff,
++				 enum wmi_direct_buffer_module id,
++				 gfp_t gfp);
+ int ath12k_dbring_wmi_cfg_setup(struct ath12k *ar,
+ 				struct ath12k_dbring *ring,
+ 				enum wmi_direct_buffer_module id);
+diff --git a/drivers/net/wireless/ath/ath12k/hw.h b/drivers/net/wireless/ath/ath12k/hw.h
+index a9888e0521a1..29a06ba1872e 100644
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -213,6 +213,9 @@ struct ath12k_hw_params {
+ 
+ 	/* setup REO queue, frag etc only for primary link peer */
+ 	bool dp_primary_link_only:1;
++	bool cfr_support;
++	u32 cfr_num_stream_bufs;
++	u32 cfr_stream_buf_size;
+ };
+ 
+ struct ath12k_hw_ops {
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
+index 881986075548..f152a76366df 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
+@@ -720,7 +720,7 @@ int ath12k_hal_srng_create_config_wcn7850(struct ath12k_hal *hal)
+ 
+ 	/* below rings are not used */
+ 	s = &hal->srng_config[HAL_RXDMA_DIR_BUF];
+-	s->max_rings = 0;
++	s->max_rings = 2;
+ 
+ 	s = &hal->srng_config[HAL_PPE2TCL];
+ 	s->max_rings = 0;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+index df045ddf42da..863e58505072 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -422,6 +422,10 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
+ 		.current_cc_support = false,
+ 
+ 		.dp_primary_link_only = true,
++
++		.cfr_support = false,
++		.cfr_num_stream_bufs = 0,
++		.cfr_stream_buf_size = 0,
+ 	},
+ 	{
+ 		.name = "wcn7850 hw2.0",
+@@ -508,6 +512,10 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
+ 		.current_cc_support = true,
+ 
+ 		.dp_primary_link_only = false,
++
++		.cfr_support = true,
++		.cfr_num_stream_bufs = 255,
++		.cfr_stream_buf_size = 8200,
+ 	},
+ 	{
+ 		.name = "qcn9274 hw2.0",
+@@ -590,6 +598,10 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
+ 		.current_cc_support = false,
+ 
+ 		.dp_primary_link_only = true,
++
++		.cfr_support = false,
++		.cfr_num_stream_bufs = 0,
++		.cfr_stream_buf_size = 0,
+ 	},
+ 	{
+ 		.name = "ipq5332 hw1.0",
+@@ -665,6 +677,10 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
+ 		.bdf_addr_offset = 0xC00000,
+ 
+ 		.dp_primary_link_only = true,
++
++		.cfr_support = false,
++		.cfr_num_stream_bufs = 0,
++		.cfr_stream_buf_size = 0,
+ 	},
+ 	{
+ 		.name = "qcc2072 hw1.0",
+@@ -752,6 +768,10 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
+ 		.current_cc_support = true,
+ 
+ 		.dp_primary_link_only = false,
++
++		.cfr_support = true,
++		.cfr_num_stream_bufs = 255,
++		.cfr_stream_buf_size = 8200,
+ 	},
+ };
+ 
+-- 
+2.34.1
+

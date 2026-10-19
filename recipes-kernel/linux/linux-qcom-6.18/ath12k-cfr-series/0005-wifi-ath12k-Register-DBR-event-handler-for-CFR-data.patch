@@ -1,0 +1,485 @@
+From 1d1c5faafaeb8c25002fc0df1d63c32d27fa615c Mon Sep 17 00:00:00 2001
+From: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+Date: Wed, 23 Sep 2026 00:38:54 -0700
+Subject: [PATCH ath-next v1 5/6] wifi: ath12k: Register DBR event handler for
+ CFR data
+
+Add handler for WMI_PDEV_DMA_RING_BUF_RELEASE_EVENT which indicates CFR
+data availability in the DB ring.
+
+Add CFR data processing from DB ring buffers. Use correlate_and_relay
+API to match CFR data with metadata from WMI_PEER_CFR_CAPTURE_EVENT.
+
+Release buffer to userspace through relayfs on successful correlation,
+otherwise hold buffer waiting for matching WMI event from firmware.
+
+Add new debug masks:
+ - ATH12K_DBG_CFR:      Enables CFR-related debug logs.
+ - ATH12K_DBG_CFR_DUMP: Enables detailed CFR data dump for analysis.
+
+Change-Id: I1521852e49760f30a19d967755424f034116d45d
+Signed-off-by: Pengfei Zhang <pengfei.zhang@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/cfr.c    | 238 ++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/cfr.h    |  82 ++++++++
+ drivers/net/wireless/ath/ath12k/dbring.c |  15 +-
+ drivers/net/wireless/ath/ath12k/dbring.h |   3 +
+ drivers/net/wireless/ath/ath12k/debug.h  |   2 +
+ 5 files changed, 336 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.c b/drivers/net/wireless/ath/ath12k/cfr.c
+index 3036e40146e6..9e461796c1de 100644
+--- a/drivers/net/wireless/ath/ath12k/cfr.c
++++ b/drivers/net/wireless/ath/ath12k/cfr.c
+@@ -9,10 +9,246 @@
+ #include "debug.h"
+ #include <linux/bitfield.h>
+ 
++struct ath12k_dbring *ath12k_cfr_get_dbring(struct ath12k *ar)
++{
++	if (ar->cfr_enabled)
++		return &ar->cfr.rx_ring;
++
++	return NULL;
++}
++
++static int ath12k_cfr_calculate_tones_from_dma_hdr(struct ath12k_cfr_dma_hdr *hdr)
++{
++	u8 bw = le32_get_bits(hdr->info1, CFIR_DMA_HDR_INFO1_UPLOAD_PKT_BW);
++	u8 preamble = le32_get_bits(hdr->info1, CFIR_DMA_HDR_INFO1_PREAMBLE_TYPE);
++
++	switch (preamble) {
++	case ATH12K_CFR_PREAMBLE_TYPE_LEGACY:
++		fallthrough;
++	case ATH12K_CFR_PREAMBLE_TYPE_VHT:
++		switch (bw) {
++		case 0:
++			return TONES_IN_20MHZ;
++		case 1: /* DUP40/VHT40 */
++			return TONES_IN_40MHZ;
++		case 2: /* DUP80/VHT80*/
++			return TONES_IN_80MHZ;
++		case 3: /* DUP160/VHT160 */
++			return TONES_IN_160MHZ;
++		default:
++			return TONES_INVALID;
++		}
++	case ATH12K_CFR_PREAMBLE_TYPE_HT:
++		switch (bw) {
++		case 0:
++			return TONES_IN_20MHZ;
++		case 1:
++			return TONES_IN_40MHZ;
++		default:
++			return TONES_INVALID;
++		}
++	default:
++		return TONES_INVALID;
++	}
++}
++
++void ath12k_cfr_release_lut_entry(struct ath12k_look_up_table *lut)
++{
++	memset(lut, 0, sizeof(*lut));
++}
++
++static void ath12k_cfr_rfs_write(struct ath12k *ar, const void *head,
++				 size_t head_len, const void *data, size_t data_len,
++				 const void *tail, size_t tail_len)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++
++	if (!cfr->rfs_cfr_capture)
++		return;
++
++	relay_write(cfr->rfs_cfr_capture, head, head_len);
++	relay_write(cfr->rfs_cfr_capture, data, data_len);
++	relay_write(cfr->rfs_cfr_capture, tail, tail_len);
++	relay_flush(cfr->rfs_cfr_capture);
++}
++
++static void ath12k_cfr_free_pending_dbr_events(struct ath12k *ar)
++{
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct ath12k_look_up_table *lut;
++	int i;
++
++	if (!cfr->lut)
++		return;
++
++	for (i = 0; i < cfr->lut_num; i++) {
++		lut = &cfr->lut[i];
++		if (lut->dbr_recv && !lut->tx_recv &&
++		    lut->dbr_tstamp < cfr->last_success_tstamp) {
++			ath12k_dbring_bufs_replenish(ar, &cfr->rx_ring, lut->buff,
++						     WMI_DIRECT_BUF_CFR, GFP_ATOMIC);
++			ath12k_cfr_release_lut_entry(lut);
++			cfr->flush_dbr_cnt++;
++		}
++	}
++}
++
++/**
++ * ath12k_cfr_correlate_and_relay() - Correlate and relay CFR events
++ * @ar: Pointer to ath12k structure
++ * @lut: Lookup table for correlation
++ * @event_type: Type of event received (TX or DBR)
++ *
++ * Correlates WMI_PDEV_DMA_RING_BUF_RELEASE_EVENT (DBR) and
++ * WMI_PEER_CFR_CAPTURE_EVENT (TX capture) by PPDU ID. If both events
++ * are present and the PPDU IDs match, returns CORRELATE_STATUS_RELEASE
++ * to relay thecorrelated data to userspace. Otherwise returns
++ * CORRELATE_STATUS_HOLD to wait for the other event.
++ *
++ * Also checks pending DBR events and clears them when no corresponding TX
++ * capture event is received for the PPDU.
++ *
++ * Return: CORRELATE_STATUS_RELEASE or CORRELATE_STATUS_HOLD
++ */
++
++static enum ath12k_cfr_correlate_status
++ath12k_cfr_correlate_and_relay(struct ath12k *ar,
++			       struct ath12k_look_up_table *lut,
++			       u8 event_type)
++{
++	enum ath12k_cfr_correlate_status status;
++	struct ath12k_cfr *cfr = &ar->cfr;
++	u64 diff;
++
++	if (event_type == ATH12K_CORRELATE_TX_EVENT) {
++		if (lut->tx_recv)
++			cfr->cfr_dma_aborts++;
++		cfr->tx_evt_cnt++;
++		lut->tx_recv = true;
++	} else if (event_type == ATH12K_CORRELATE_DBR_EVENT) {
++		cfr->dbr_evt_cnt++;
++		lut->dbr_recv = true;
++	}
++
++	if (lut->dbr_recv && lut->tx_recv) {
++		if (lut->dbr_ppdu_id == lut->tx_ppdu_id) {
++			/*
++			 * 64-bit counters make wraparound highly improbable,
++			 * wraparound handling is omitted.
++			 */
++			cfr->last_success_tstamp = lut->dbr_tstamp;
++			if (lut->dbr_tstamp > lut->txrx_tstamp) {
++				diff = lut->dbr_tstamp - lut->txrx_tstamp;
++				ath12k_dbg(ar->ab, ATH12K_DBG_CFR,
++					   "txrx event -> dbr event delay = %u ms",
++					   jiffies_to_msecs(diff));
++			} else if (lut->txrx_tstamp > lut->dbr_tstamp) {
++				diff = lut->txrx_tstamp - lut->dbr_tstamp;
++				ath12k_dbg(ar->ab, ATH12K_DBG_CFR,
++					   "dbr event -> txrxevent delay = %u ms",
++					   jiffies_to_msecs(diff));
++			}
++
++			ath12k_cfr_free_pending_dbr_events(ar);
++
++			cfr->release_cnt++;
++			status = ATH12K_CORRELATE_STATUS_RELEASE;
++
++		} else {
++			/*
++			 * Discard TXRX event on PPDU ID mismatch because multiple PPDUs
++			 * may share the same DMA address due to ucode aborts
++			 */
++			ath12k_dbg(ar->ab, ATH12K_DBG_CFR,
++				   "Received dbr event twice for the same lut entry");
++			lut->tx_recv = false;
++			lut->tx_ppdu_id = 0;
++			cfr->clear_txrx_event++;
++			cfr->cfr_dma_aborts++;
++			status = ATH12K_CORRELATE_STATUS_HOLD;
++		}
++	} else {
++		status = ATH12K_CORRELATE_STATUS_HOLD;
++	}
++
++	return status;
++}
++
+ static int ath12k_cfr_process_data(struct ath12k *ar,
+ 				   struct ath12k_dbring_data *param)
+ {
+-	return 0;
++	u32 end_magic = ATH12K_CFR_END_MAGIC;
++	struct ath12k_csi_cfr_header *header;
++	struct ath12k_cfr_dma_hdr *dma_hdr;
++	struct ath12k_cfr *cfr = &ar->cfr;
++	struct ath12k_look_up_table *lut;
++	struct ath12k_base *ab = ar->ab;
++	u32 buf_id, tones, length;
++	u8 num_chains;
++	int status;
++	u8 *data;
++
++	data = param->data;
++	buf_id = param->buf_id;
++
++	if (param->data_sz < sizeof(*dma_hdr))
++		return -EINVAL;
++
++	dma_hdr = (struct ath12k_cfr_dma_hdr *)data;
++
++	tones = ath12k_cfr_calculate_tones_from_dma_hdr(dma_hdr);
++	if (tones == TONES_INVALID) {
++		ath12k_warn(ar->ab, "Number of tones received is invalid\n");
++		return -EINVAL;
++	}
++
++	num_chains = le32_get_bits(dma_hdr->info1, CFIR_DMA_HDR_INFO1_NUM_CHAINS);
++
++	length = sizeof(*dma_hdr);
++	length += tones * (num_chains + 1);
++
++	spin_lock_bh(&cfr->lut_lock);
++
++	if (!cfr->lut) {
++		spin_unlock_bh(&cfr->lut_lock);
++		return -EINVAL;
++	}
++
++	lut = &cfr->lut[buf_id];
++
++	ath12k_dbg_dump(ab, ATH12K_DBG_CFR_DUMP, "data_from_buf_rel", "",
++			data, length);
++
++	lut->buff = param->buff;
++	lut->dbr_address = param->buff->paddr;
++	lut->data = data;
++	lut->data_len = length;
++	lut->dbr_ppdu_id = dma_hdr->phy_ppdu_id;
++	lut->dbr_tstamp = jiffies;
++
++	memcpy(&lut->hdr, dma_hdr, sizeof(*dma_hdr));
++
++	header = &lut->header;
++	header->meta_data.channel_bw = le32_get_bits(dma_hdr->info1, CFIR_DMA_HDR_INFO1_UPLOAD_PKT_BW);
++	header->meta_data.length = length;
++
++	status = ath12k_cfr_correlate_and_relay(ar, lut,
++						ATH12K_CORRELATE_DBR_EVENT);
++	if (status == ATH12K_CORRELATE_STATUS_RELEASE) {
++		ath12k_dbg(ab, ATH12K_DBG_CFR,
++			   "releasing CFR data to user space");
++		ath12k_cfr_rfs_write(ar, &lut->header,
++				     sizeof(struct ath12k_csi_cfr_header),
++				     lut->data, lut->data_len,
++				     &end_magic, sizeof(u32));
++	} else if (status == ATH12K_CORRELATE_STATUS_HOLD) {
++		ath12k_dbg(ab, ATH12K_DBG_CFR,
++			   "tx event is not yet received holding the buf");
++	}
++
++	spin_unlock_bh(&cfr->lut_lock);
++
++	return status;
+ }
+ 
+ /* Helper function to check whether the given peer mac address
+diff --git a/drivers/net/wireless/ath/ath12k/cfr.h b/drivers/net/wireless/ath/ath12k/cfr.h
+index 7f8b8614fce1..f20da7aab27d 100644
+--- a/drivers/net/wireless/ath/ath12k/cfr.h
++++ b/drivers/net/wireless/ath/ath12k/cfr.h
+@@ -19,9 +19,78 @@
+ 
+ #define HOST_MAX_CHAINS 8
+ 
++enum ath12k_cfr_correlate_event_type {
++	ATH12K_CORRELATE_DBR_EVENT,
++	ATH12K_CORRELATE_TX_EVENT,
++};
++
+ struct ath12k_link_sta;
+ struct ath12k_per_peer_cfr_capture;
+ 
++#define ATH12K_CFR_END_MAGIC 0xBEAFDEAD
++
++enum ath12k_cfr_correlate_status {
++	ATH12K_CORRELATE_STATUS_RELEASE,
++	ATH12K_CORRELATE_STATUS_HOLD,
++	ATH12K_CORRELATE_STATUS_ERR,
++};
++
++enum ath12k_cfr_preamble_type {
++	ATH12K_CFR_PREAMBLE_TYPE_LEGACY,
++	ATH12K_CFR_PREAMBLE_TYPE_HT,
++	ATH12K_CFR_PREAMBLE_TYPE_VHT,
++};
++
++struct cfr_metadata {
++	u8 peer_addr[ETH_ALEN];
++	u8 status;
++	u8 capture_bw;
++	u8 channel_bw;
++	u8 phy_mode;
++	u16 prim20_chan;
++	u16 center_freq1;
++	u16 center_freq2;
++	u8 capture_mode;
++	u8 capture_type;
++	u8 sts_count;
++	u8 num_rx_chain;
++	u32 timestamp;
++	u32 length;
++	u32 chain_rssi[WMI_MAX_CHAINS];
++	u16 chain_phase[HOST_MAX_CHAINS];
++	u32 cfo_measurement;
++	u8 agc_gain[HOST_MAX_CHAINS];
++	u32 rx_start_ts;
++} __packed;
++
++struct ath12k_csi_cfr_header {
++	u32 start_magic_num;
++	u32 vendorid;
++	u8 cfr_metadata_version;
++	u8 cfr_data_version;
++	u8 chip_type;
++	u8 platform_type;
++	u32 cfr_metadata_len;
++	struct cfr_metadata meta_data;
++} __packed;
++
++#define TONES_IN_20MHZ  256
++#define TONES_IN_40MHZ  512
++#define TONES_IN_80MHZ  1024
++#define TONES_IN_160MHZ 2048 /* 160 MHz isn't supported yet */
++#define TONES_INVALID   0
++
++#define CFIR_DMA_HDR_INFO0_TAG GENMASK(7, 0)
++#define CFIR_DMA_HDR_INFO0_LEN GENMASK(13, 8)
++
++#define CFIR_DMA_HDR_INFO1_UPLOAD_DONE      GENMASK(0, 0)
++#define CFIR_DMA_HDR_INFO1_CAPTURE_TYPE     GENMASK(3, 1)
++#define CFIR_DMA_HDR_INFO1_PREAMBLE_TYPE    GENMASK(5, 4)
++#define CFIR_DMA_HDR_INFO1_NSS              GENMASK(8, 6)
++#define CFIR_DMA_HDR_INFO1_NUM_CHAINS       GENMASK(11, 9)
++#define CFIR_DMA_HDR_INFO1_UPLOAD_PKT_BW    GENMASK(14, 12)
++#define CFIR_DMA_HDR_INFO1_SW_PEER_ID_VALID GENMASK(15, 15)
++
+ struct ath12k_cfr_dma_hdr {
+ 	u16 info0;
+ 	u16 info1;
+@@ -110,6 +179,8 @@ int ath12k_cfr_send_peer_cfr_capture_cmd(struct ath12k *ar,
+ 					 struct ath12k_link_sta *arsta,
+ 					 struct ath12k_per_peer_cfr_capture *params,
+ 					 const u8 *peer_mac);
++struct ath12k_dbring *ath12k_cfr_get_dbring(struct ath12k *ar);
++void ath12k_cfr_release_lut_entry(struct ath12k_look_up_table *lut);
+ #else
+ static inline int ath12k_cfr_init(struct ath12k_base *ab)
+ {
+@@ -156,5 +227,16 @@ ath12k_cfr_send_peer_cfr_capture_cmd(struct ath12k *ar,
+ {
+ 	return 0;
+ }
++
++static inline void ath12k_cfr_release_lut_entry(struct ath12k_look_up_table *lut)
++{
++}
++
++static inline
++struct ath12k_dbring *ath12k_cfr_get_dbring(struct ath12k *ar)
++{
++	return NULL;
++}
++
+ #endif /* CONFIG_ATH12K_CFR */
+ #endif /* ATH12K_CFR_H */
+diff --git a/drivers/net/wireless/ath/ath12k/dbring.c b/drivers/net/wireless/ath/ath12k/dbring.c
+index 4a9ef50ec9a0..cd3671e2f41b 100644
+--- a/drivers/net/wireless/ath/ath12k/dbring.c
++++ b/drivers/net/wireless/ath/ath12k/dbring.c
+@@ -103,7 +103,7 @@ static int ath12k_dbring_fill_bufs(struct ath12k *ar,
+ 		if (!buff)
+ 			break;
+ 
+-		ret = ath12k_dbring_bufs_replenish(ar, ring, buff, gfp);
++		ret = ath12k_dbring_bufs_replenish(ar, ring, buff, ring->id, gfp);
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to replenish db ring num_remain %d req_ent %d\n",
+ 				    num_remain, req_entries);
+@@ -179,6 +179,7 @@ int ath12k_dbring_buf_setup(struct ath12k *ar,
+ 	ring->buf_sz = db_cap->min_buf_sz;
+ 	ring->buf_align = db_cap->min_buf_align;
+ 	ring->pdev_id = db_cap->pdev_id;
++	ring->id = db_cap->id;
+ 	ring->hp_addr = ath12k_hal_srng_get_hp_addr(ab, srng);
+ 	ring->tp_addr = ath12k_hal_srng_get_tp_addr(ab, srng);
+ 
+@@ -248,6 +249,7 @@ int ath12k_dbring_buffer_release_event(struct ath12k_base *ab,
+ 	int size;
+ 	dma_addr_t paddr;
+ 	int ret = 0;
++	int status;
+ 
+ 	pdev_idx = le32_to_cpu(ev->fixed.pdev_id);
+ 
+@@ -275,6 +277,9 @@ int ath12k_dbring_buffer_release_event(struct ath12k_base *ab,
+ 	switch (ev->fixed.module_id) {
+ 	case WMI_DIRECT_BUF_SPECTRAL:
+ 		break;
++	case WMI_DIRECT_BUF_CFR:
++		ring = ath12k_cfr_get_dbring(ar);
++		break;
+ 	default:
+ 		ring = NULL;
+ 		ath12k_warn(ab, "Recv dma buffer release ev on unsupp module %d\n",
+@@ -322,12 +327,16 @@ int ath12k_dbring_buffer_release_event(struct ath12k_base *ab,
+ 			handler_data.data = PTR_ALIGN(vaddr_unalign,
+ 						      ring->buf_align);
+ 			handler_data.data_sz = ring->buf_sz;
++			handler_data.buff = buff;
++			handler_data.buf_id = buf_id;
+ 
+-			ring->handler(ar, &handler_data);
++			status = ring->handler(ar, &handler_data);
++			if (status == ATH12K_CORRELATE_STATUS_HOLD)
++				continue;
+ 		}
+ 
+ 		memset(buff, 0, size);
+-		ath12k_dbring_bufs_replenish(ar, ring, buff, GFP_ATOMIC);
++		ath12k_dbring_bufs_replenish(ar, ring, buff, ring->id, GFP_ATOMIC);
+ 	}
+ 
+ 	spin_unlock_bh(&srng->lock);
+diff --git a/drivers/net/wireless/ath/ath12k/dbring.h b/drivers/net/wireless/ath/ath12k/dbring.h
+index 7ee8f35848b7..f86e5d8169c1 100644
+--- a/drivers/net/wireless/ath/ath12k/dbring.h
++++ b/drivers/net/wireless/ath/ath12k/dbring.h
+@@ -21,6 +21,8 @@ struct ath12k_dbring_data {
+ 	void *data;
+ 	u32 data_sz;
+ 	struct ath12k_wmi_dma_buf_release_meta_data_params meta;
++	struct ath12k_dbring_element *buff;
++	u32 buf_id;
+ };
+ 
+ struct ath12k_dbring_buf_release_event {
+@@ -41,6 +43,7 @@ struct ath12k_dbring_cap {
+ 
+ struct ath12k_dbring {
+ 	struct dp_srng refill_srng;
++	enum wmi_direct_buffer_module id;
+ 	struct idr bufs_idr;
+ 	/* Protects bufs_idr */
+ 	spinlock_t idr_lock;
+diff --git a/drivers/net/wireless/ath/ath12k/debug.h b/drivers/net/wireless/ath/ath12k/debug.h
+index bf254e43a68d..2a1b53aae15d 100644
+--- a/drivers/net/wireless/ath/ath12k/debug.h
++++ b/drivers/net/wireless/ath/ath12k/debug.h
+@@ -27,6 +27,8 @@ enum ath12k_debug_mask {
+ 	ATH12K_DBG_DP_RX	= 0x00004000,
+ 	ATH12K_DBG_WOW		= 0x00008000,
+ 	ATH12K_DBG_CE		= 0x00010000,
++	ATH12K_DBG_CFR		= 0x00020000,
++	ATH12K_DBG_CFR_DUMP	= 0x00040000,
+ 	ATH12K_DBG_ANY		= 0xffffffff,
+ };
+ 
+-- 
+2.34.1
+
