@@ -29,9 +29,14 @@ KERNEL_LOCALVERSION ?= "${@qcom_kernel_localversion(d)}"
 
 SRC_URI = "git://github.com/qualcomm-linux/kernel.git;${SRCBRANCH};protocol=https"
 
-# Additional kernel configs.
 SRC_URI += " \
     file://configs/bsp-additions.cfg \
+    file://series/0001-wifi-ath12k-Add-initialization-and-deinitialization-.patch \
+    file://series/0002-wifi-ath12k-Register-debugfs-for-CFR-configuration.patch \
+    file://series/0003-wifi-ath12k-Add-support-unassociated-client-CFR.patch \
+    file://series/0004-wifi-ath12k-Register-relayfs-entries-for-CFR-dump.patch \
+    file://series/0005-wifi-ath12k-Register-DBR-event-handler-for-CFR-data.patch \
+    file://series/0006-wifi-ath12k-Register-handler-for-CFR-capture-event.patch \
 "
 
 # To build tip of qcom-next branch set preferred
